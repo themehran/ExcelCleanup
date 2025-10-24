@@ -1,6 +1,6 @@
-# Noor Queue Export Convert
+# Export Convert
 
-A Python utility script to reshape Noor Queue export files into the format expected by the Noor appointment importer, with enhanced date handling for Jalali and Gregorian calendars.
+A Python utility script to reshape Queue export files into the format expected by the appointment importer, with enhanced date handling for Jalali and Gregorian calendars.
 
 ## Features
 
@@ -157,19 +157,13 @@ Patient statuses are mapped to tags:
 
 ## Examples
 
-### Example 1: Basic Conversion
-```bash
-python convert_excel.py ResultQTel-14040401-14040801.xlsx
-```
-Output: `ResultQTel-14040401-14040801_cleaned.xlsx`
-
-### Example 2: Multiple Files
+### Example 1: Multiple Files
 ```bash
 python convert_excel.py file1.xlsx file2.xlsx -o merged_output.xlsx
 ```
 Output: `merged_output.xlsx`
 
-### Example 3: Debug Mode
+### Example 2: Debug Mode
 ```bash
 python convert_excel.py input.xlsx --log-level DEBUG
 ```
