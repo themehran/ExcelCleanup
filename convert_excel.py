@@ -18,18 +18,81 @@ Output columns (English):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import random
 import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, Mapping, Tuple
 
 import pandas as pd
+import jdatetime
 
 
 LOGGER = logging.getLogger(__name__)
 
 PERSIAN_DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+# Load Persian names gender database
+def _load_persian_names_gender() -> dict:
+    """Load Persian names gender database from CSV and JSON files."""
+    gender_lookup = {}
+
+    # First, try to load from CSV file (higher priority)
+    try:
+        csv_path = Path("iranian_names_full.csv")
+        if csv_path.exists():
+            df = pd.read_csv(csv_path)
+            for _, row in df.iterrows():
+                name_fa = str(row['name_fa']).strip()
+                gender = str(row['gender']).strip().lower()
+                if name_fa and gender in ['male', 'female']:
+                    gender_lookup[name_fa] = gender
+
+            LOGGER.info("Loaded %d Persian names from CSV file", len(gender_lookup))
+        else:
+            LOGGER.warning("Iranian names CSV file not found: %s", csv_path)
+    except Exception as e:
+        LOGGER.error("Error loading Persian names from CSV: %s", e)
+
+    # Then, try to load from JSON file (lower priority, only if not already in lookup)
+    try:
+        json_path = Path("persian_names_gender.json")
+        if json_path.exists():
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Add male names (only if not already in lookup)
+            for name in data.get("male", []):
+                if name not in gender_lookup:
+                    gender_lookup[name] = "male"
+
+            # Add female names (only if not already in lookup)
+            for name in data.get("female", []):
+                if name not in gender_lookup:
+                    gender_lookup[name] = "female"
+
+            # Add unisex names (randomly assign male/female, only if not already in lookup)
+            for name in data.get("unisex", []):
+                if name not in gender_lookup:
+                    gender_lookup[name] = random.choice(["male", "female"])
+
+            LOGGER.info("Added %d additional names from JSON file",
+                       len([name for name in data.get("male", []) + data.get("female", []) + data.get("unisex", [])
+                            if name not in gender_lookup]))
+        else:
+            LOGGER.warning("Persian names JSON file not found: %s", json_path)
+    except Exception as e:
+        LOGGER.error("Error loading Persian names from JSON: %s", e)
+
+    if not gender_lookup:
+        LOGGER.warning("No Persian names gender database found. Gender detection will be disabled.")
+
+    return gender_lookup
+
+# Global gender lookup dictionary
+PERSIAN_GENDER_LOOKUP = _load_persian_names_gender()
 
 COLUMN_ALIASES: Mapping[str, Tuple[str, ...]] = {
     "national_id": ("کدملی", "کد ملی", "شناسه ملی"),
@@ -165,68 +228,25 @@ CLINIC_TAG_MAP = _prepare_normalized_mapping(CLINIC_TAG_SOURCE)
 
 
 def jalali_to_gregorian(j_year: int, j_month: int, j_day: int) -> Tuple[int, int, int]:
-    if not (1 <= j_month <= 12):
-        raise ValueError(f"Invalid Jalali month: {j_month}")
+    """
+    Convert Jalali date to Gregorian using jdatetime library.
+    """
     try:
-        _ = JALALI_MONTH_DAYS[j_month - 1]
-    except IndexError as exc:
-        raise ValueError(f"Invalid Jalali month: {j_month}") from exc
-
-    jy = j_year - 979
-    jm = j_month - 1
-    jd = j_day - 1
-
-    if jm < 0 or jd < 0:
-        raise ValueError("Invalid Jalali date components.")
-
-    j_day_no = 365 * jy + jy // 33 * 8 + ((jy % 33) + 3) // 4
-    for i in range(jm):
-        j_day_no += JALALI_MONTH_DAYS[i]
-    j_day_no += jd
-
-    g_day_no = j_day_no + 79
-
-    gy = 1600 + 400 * (g_day_no // 146097)
-    g_day_no %= 146097
-
-    leap = True
-    if g_day_no >= 36525:
-        g_day_no -= 1
-        gy += 100 * (g_day_no // 36524)
-        g_day_no %= 36524
-        if g_day_no >= 365:
-            g_day_no += 1
-        else:
-            leap = False
-
-    gy += 4 * (g_day_no // 1461)
-    g_day_no %= 1461
-
-    if g_day_no >= 366:
-        leap = False
-        g_day_no -= 1
-        gy += g_day_no // 365
-        g_day_no %= 365
-
-    gd = g_day_no + 1
-    gregorian_month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    gm = 0
-    while gm < 12:
-        days_in_month = gregorian_month_days[gm]
-        if gm == 1 and leap:
-            days_in_month += 1
-        if gd <= days_in_month:
-            break
-        gd -= days_in_month
-        gm += 1
-
-    if gm >= 12:
-        raise ValueError("Converted Gregorian month out of range.")
-
-    return gy, gm + 1, gd
+        jalali_date = jdatetime.date(j_year, j_month, j_day)
+        gregorian_date = jalali_date.togregorian()
+        return gregorian_date.year, gregorian_date.month, gregorian_date.day
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid Jalali date: {j_year}/{j_month}/{j_day}") from e
 
 
 def parse_visit_date(value: object) -> pd.Timestamp:
+    """
+    Enhanced date parsing that:
+    1. Detects Jalali vs Gregorian dates automatically
+    2. Converts Jalali to Gregorian for database storage
+    3. Handles time components (defaults to 00:00 if missing)
+    4. Validates date ranges appropriately
+    """
     if value is None or pd.isna(value):
         return pd.NaT
     if isinstance(value, pd.Timestamp):
@@ -237,32 +257,90 @@ def parse_visit_date(value: object) -> pd.Timestamp:
         excel_candidate = pd.to_datetime(value, unit="D", origin="1899-12-30", errors="coerce")
         if not pd.isna(excel_candidate):
             return excel_candidate
+
     text = normalize_digits(value)
     text = re.sub(r"[\u200c\u200f]", "", text)
     text = text.replace(".", "/").replace("-", "/").strip()
     if not text:
         return pd.NaT
+
+    # Handle 8-digit format (YYYYMMDD)
     if re.fullmatch(r"\d{8}", text):
         text = f"{text[:4]}/{text[4:6]}/{text[6:]}"
 
-    direct = pd.to_datetime(text, errors="coerce", dayfirst=False)
-    if not pd.isna(direct) and direct.year >= 1900:
-        return direct
+    # Try to parse as datetime with time component first
+    datetime_patterns = [
+        r"(\d{3,4})/(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{1,2})",  # YYYY/MM/DD HH:MM
+        r"(\d{3,4})/(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})",  # YYYY/MM/DD HH:MM:SS
+    ]
 
+    for pattern in datetime_patterns:
+        match = re.search(pattern, text)
+        if match:
+            groups = match.groups()
+            year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+            hour = int(groups[3]) if len(groups) > 3 else 0
+            minute = int(groups[4]) if len(groups) > 4 else 0
+            second = int(groups[5]) if len(groups) > 5 else 0
+
+            # Determine if it's Jalali or Gregorian
+            if _is_jalali_date(year, month, day):
+                try:
+                    gy, gm, gd = jalali_to_gregorian(year, month, day)
+                    return pd.Timestamp(datetime(gy, gm, gd, hour, minute, second))
+                except ValueError:
+                    return pd.NaT
+            else:
+                # Gregorian date
+                try:
+                    return pd.Timestamp(datetime(year, month, day, hour, minute, second))
+                except ValueError:
+                    return pd.NaT
+
+    # Try to parse as date only (no time)
     match = re.search(r"(\d{3,4})/(\d{1,2})/(\d{1,2})", text)
     if not match:
         return pd.NaT
-    jy, jm, jd = map(int, match.groups())
-    if jy < 1700:
+
+    year, month, day = map(int, match.groups())
+
+    # Determine if it's Jalali or Gregorian
+    if _is_jalali_date(year, month, day):
         try:
-            gy, gm, gd = jalali_to_gregorian(jy, jm, jd)
-            return pd.Timestamp(datetime(gy, gm, gd))
+            gy, gm, gd = jalali_to_gregorian(year, month, day)
+            # Default to 00:00:00 if no time specified
+            return pd.Timestamp(datetime(gy, gm, gd, 0, 0, 0))
         except ValueError:
             return pd.NaT
-    return pd.NaT
+    else:
+        # Gregorian date - default to 00:00:00 if no time specified
+        try:
+            return pd.Timestamp(datetime(year, month, day, 0, 0, 0))
+        except ValueError:
+            return pd.NaT
+
+
+def _is_jalali_date(year: int, month: int, day: int) -> bool:
+    """
+    Determine if a date is likely Jalali using jdatetime library validation.
+    """
+    # Jalali years are typically in the 1300-1500 range
+    if year < 1300 or year > 1500:
+        return False
+
+    # Use jdatetime to validate if it's a valid Jalali date
+    try:
+        jdatetime.date(year, month, day)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def format_visit_date(value: pd.Timestamp) -> str | pd.NA:
+    """
+    Format date for database storage (always Gregorian/ISO format).
+    This ensures data integrity by storing dates in a standard format.
+    """
     if pd.isna(value):
         return pd.NA
     if isinstance(value, pd.Timestamp):
@@ -274,6 +352,88 @@ def format_visit_date(value: pd.Timestamp) -> str | pd.NA:
     if pd.isna(ts):
         return pd.NA
     return ts.strftime("%Y-%m-%d")
+
+
+def format_visit_date_for_ui(value: pd.Timestamp) -> str | pd.NA:
+    """
+    Format date for UI display (Jalali format for better user experience).
+    This converts Gregorian dates back to Jalali for display purposes.
+    """
+    if pd.isna(value):
+        return pd.NA
+    if isinstance(value, pd.Timestamp):
+        ts = value.tz_localize(None) if value.tzinfo else value
+    elif isinstance(value, (datetime, date)):
+        ts = pd.Timestamp(value)
+    else:
+        ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return pd.NA
+
+    # Convert Gregorian to Jalali for display
+    try:
+        jy, jm, jd = gregorian_to_jalali(ts.year, ts.month, ts.day)
+        return f"{jy:04d}/{jm:02d}/{jd:02d}"
+    except (ValueError, TypeError):
+        # Fallback to Gregorian if conversion fails
+        return ts.strftime("%Y-%m-%d")
+
+
+def format_visit_datetime_for_ui(value: pd.Timestamp) -> str | pd.NA:
+    """
+    Format datetime for UI display (Jalali format with time).
+    This converts Gregorian datetime back to Jalali for display purposes.
+    """
+    if pd.isna(value):
+        return pd.NA
+    if isinstance(value, pd.Timestamp):
+        ts = value.tz_localize(None) if value.tzinfo else value
+    elif isinstance(value, (datetime, date)):
+        ts = pd.Timestamp(value)
+    else:
+        ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return pd.NA
+
+    # Convert Gregorian to Jalali for display
+    try:
+        jy, jm, jd = gregorian_to_jalali(ts.year, ts.month, ts.day)
+        return f"{jy:04d}/{jm:02d}/{jd:02d} {ts.hour:02d}:{ts.minute:02d}"
+    except (ValueError, TypeError):
+        # Fallback to Gregorian if conversion fails
+        return ts.strftime("%Y-%m-%d %H:%M")
+
+
+def format_visit_date_for_database(value: pd.Timestamp) -> str | pd.NA:
+    """
+    Format date for database storage (ISO format with timezone).
+    This ensures proper database storage and querying capabilities.
+    """
+    if pd.isna(value):
+        return pd.NA
+    if isinstance(value, pd.Timestamp):
+        ts = value.tz_localize(None) if value.tzinfo else value
+    elif isinstance(value, (datetime, date)):
+        ts = pd.Timestamp(value)
+    else:
+        ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return pd.NA
+
+    # Return ISO format for database storage
+    return ts.isoformat()
+
+
+def gregorian_to_jalali(g_year: int, g_month: int, g_day: int) -> Tuple[int, int, int]:
+    """
+    Convert Gregorian date to Jalali using jdatetime library.
+    """
+    try:
+        gregorian_date = datetime(g_year, g_month, g_day).date()
+        jalali_date = jdatetime.date.fromgregorian(date=gregorian_date)
+        return jalali_date.year, jalali_date.month, jalali_date.day
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid Gregorian date: {g_year}/{g_month}/{g_day}") from e
 
 
 def build_tags(row: pd.Series) -> str:
@@ -305,28 +465,46 @@ def build_tags(row: pd.Series) -> str:
 
 def clean_national_id(value: object) -> str | pd.NA:
     digits = re.sub(r"\D", "", normalize_digits(value))
-    if len(digits) != 10:
+    if len(digits) < 8 or len(digits) > 11:
         return pd.NA
     if len(set(digits)) == 1:
         return pd.NA
-    checksum = int(digits[-1])
-    total = sum(int(digits[i]) * (10 - i) for i in range(9))
-    remainder = total % 11
-    if (remainder < 2 and checksum == remainder) or (remainder >= 2 and checksum + remainder == 11):
-        return digits
+
+    # More lenient validation - accept 8-11 digit national IDs
+    # This allows more records to pass through while still filtering obvious invalid IDs
+    try:
+        # Basic validation: should be 8-11 digits, not all the same
+        if 8 <= len(digits) <= 11 and len(set(digits)) > 1:
+            return digits
+    except (ValueError, TypeError):
+        pass
     return pd.NA
 
 
 def clean_mobile(value: object) -> str | pd.NA:
     digits = re.sub(r"\D", "", normalize_digits(value))
+    if not digits:
+        return pd.NA
+
+    # More lenient mobile validation
+    # Handle different formats
     if digits.startswith("98") and len(digits) == 12:
         digits = "0" + digits[2:]
     if digits.startswith("0098") and len(digits) == 14:
         digits = "0" + digits[4:]
     if len(digits) == 10 and not digits.startswith("0"):
         digits = "0" + digits
+
+    # Accept various valid Iranian mobile formats
     if len(digits) == 11 and digits.startswith("09"):
         return digits
+    elif len(digits) == 10 and digits.startswith("9"):
+        return "0" + digits
+    elif len(digits) == 10:
+        return digits  # Accept 10-digit numbers as valid
+    elif len(digits) == 11:
+        return digits  # Accept 11-digit numbers as valid
+
     return pd.NA
 
 
@@ -346,7 +524,120 @@ def split_full_name(value: object) -> Tuple[str | pd.NA, str | pd.NA]:
     return first, last
 
 
-def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def detect_gender(first_name: object) -> str | pd.NA:
+    """
+    Detect gender based on Persian first name using local database lookup.
+    Returns 'male', 'female', or pd.NA if not found.
+    """
+    if first_name is None or pd.isna(first_name):
+        return pd.NA
+
+    # Normalize the name
+    name = normalize_farsi_text(first_name).strip()
+    if not name:
+        return pd.NA
+
+    # Look up in the gender database
+    gender = PERSIAN_GENDER_LOOKUP.get(name)
+    if gender:
+        return gender
+
+    # Try with first word only (in case of compound names)
+    first_word = name.split()[0] if name.split() else name
+    gender = PERSIAN_GENDER_LOOKUP.get(first_word)
+    if gender:
+        return gender
+
+    # Try with common Persian name patterns
+    # Remove common prefixes/suffixes and try again
+    cleaned_name = re.sub(r'^(آقای|خانم|دکتر|مهندس|استاد|جناب|سرکار|سرکار خانم|آقا|خانم)\s*', '', name)
+    if cleaned_name != name:
+        gender = PERSIAN_GENDER_LOOKUP.get(cleaned_name)
+        if gender:
+            return gender
+
+    return pd.NA
+
+
+def _is_name_complete(first_name: str, last_name: str) -> bool:
+    """Check if name is complete (both first and last name have at least 3 characters)."""
+    if pd.isna(first_name) or pd.isna(last_name):
+        return False
+    first_str = str(first_name).strip()
+    last_str = str(last_name).strip()
+    return len(first_str) >= 3 and len(last_str) >= 3
+
+
+def _enhanced_deduplication(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enhanced deduplication that:
+    1. Keeps most recent record per national_id
+    2. If most recent record has incomplete name, looks for earlier records with complete name
+    3. Returns records with incomplete names that couldn't be completed
+    """
+    result_records = []
+    incomplete_records = []
+
+    # Group by national_id
+    for national_id, group in df.groupby("national_id"):
+        if pd.isna(national_id):
+            continue
+
+        # Sort group by visit_date_parsed (most recent first)
+        group = group.sort_values("visit_date_parsed", ascending=False, na_position="last")
+
+        # Get the most recent record
+        most_recent = group.iloc[0]
+
+        # Check if most recent record has complete name
+        if _is_name_complete(most_recent["first_name"], most_recent["last_name"]):
+            # Use most recent record
+            result_records.append(most_recent)
+        else:
+            # Look for earlier records with complete name
+            found_complete = False
+            for _, record in group.iterrows():
+                if _is_name_complete(record["first_name"], record["last_name"]):
+                    # Use the most recent record but with complete name from earlier record
+                    updated_record = most_recent.copy()
+                    updated_record["first_name"] = record["first_name"]
+                    updated_record["last_name"] = record["last_name"]
+                    updated_record["full_name"] = f"{record['first_name']} {record['last_name']}"
+                    result_records.append(updated_record)
+                    found_complete = True
+                    break
+
+            if not found_complete:
+                # No complete name found, add to incomplete records
+                incomplete_records.append(most_recent)
+
+    # Convert to DataFrames
+    if result_records:
+        result_df = pd.DataFrame(result_records)
+    else:
+        result_df = pd.DataFrame(columns=df.columns)
+
+    if incomplete_records:
+        incomplete_df = pd.DataFrame(incomplete_records)
+        # Store incomplete records globally for later use
+        _enhanced_deduplication.incomplete_records = incomplete_df
+    else:
+        _enhanced_deduplication.incomplete_records = pd.DataFrame(columns=df.columns)
+
+    LOGGER.info("Enhanced deduplication: %d complete records, %d incomplete records",
+                len(result_df), len(incomplete_records))
+
+    return result_df
+
+
+def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Enhanced cleaning function that returns 4 dataframes:
+    1. cleaned_output: Valid records with complete names
+    2. excluded_output: Records with invalid/incomplete names
+    3. duplicate_phone_output: Records with duplicate phone numbers
+    4. incomplete_name_output: Records where name couldn't be completed from earlier records
+    """
     selectors = _select_columns(df.columns)
     optional_selectors = _select_optional_columns(df.columns)
 
@@ -390,6 +681,9 @@ def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
     subset = subset.join(name_parts)
 
+    # Add gender detection
+    subset["gender"] = subset["first_name"].apply(detect_gender)
+
     # Parse visit dates BEFORE filtering (needed for deduplication across all records)
     subset["visit_date_parsed"] = subset["visit_date_raw"].apply(parse_visit_date)
 
@@ -398,11 +692,8 @@ def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         by=["national_id", "visit_date_parsed"], ascending=[True, False], na_position="last"
     )
 
-    # Keep most recent record per national_id (based on تاریخ اخذ)
-    before_dedup = len(subset)
-    subset = subset.drop_duplicates(subset=["national_id"], keep="first").copy()
-    if len(subset) != before_dedup:
-        LOGGER.info("Kept most recent record per national_id, removed %d older duplicate records", before_dedup - len(subset))
+    # Enhanced deduplication logic with name completion
+    subset = _enhanced_deduplication(subset)
 
     # Now apply name validation filters
     full_names = subset["full_name"].fillna("").astype(str)
@@ -410,9 +701,9 @@ def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     contains_punctuation = full_names.str.contains(r"[.\-]", regex=True)
     contains_english = full_names.str.contains(r"[A-Za-z]", case=False, regex=True)
 
-    # Check if first_name or last_name is less than 2 characters
-    first_name_too_short = subset["first_name"].fillna("").astype(str).str.len() < 2
-    last_name_too_short = subset["last_name"].fillna("").astype(str).str.len() < 2
+    # Check if first_name or last_name is less than 3 characters (enhanced requirement)
+    first_name_too_short = subset["first_name"].fillna("").astype(str).str.len() < 3
+    last_name_too_short = subset["last_name"].fillna("").astype(str).str.len() < 3
 
     # Check if first_name or last_name contains only digits
     first_name_numeric = subset["first_name"].fillna("").astype(str).str.match(r"^\d+$")
@@ -436,24 +727,71 @@ def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         LOGGER.warning("Dropping %d rows missing required fields", dropped)
     subset = subset[required_mask].copy()
 
-    subset["visit_date"] = subset["visit_date_parsed"].apply(format_visit_date)
+    # Check for duplicate phone numbers
+    phone_duplicates = subset[subset["mobile"].notna() & subset.duplicated(subset=["mobile"], keep=False)]
+    if not phone_duplicates.empty:
+        LOGGER.info("Found %d records with duplicate phone numbers", len(phone_duplicates))
+        # Remove duplicates from main dataset
+        subset = subset.drop(phone_duplicates.index)
+
+    # Format dates for different purposes
+    subset["visit_date"] = subset["visit_date_parsed"].apply(format_visit_date)  # Database storage (Gregorian)
+    subset["visit_date_ui"] = subset["visit_date_parsed"].apply(format_visit_date_for_ui)  # UI display (Jalali)
+    subset["visit_datetime_ui"] = subset["visit_date_parsed"].apply(format_visit_datetime_for_ui)  # UI display with time
+    subset["visit_date_db"] = subset["visit_date_parsed"].apply(format_visit_date_for_database)  # Database ISO format
     subset["tags"] = subset.apply(build_tags, axis=1)
 
-    cleaned_output = subset[["national_id", "first_name", "last_name", "mobile", "visit_date", "tags"]].copy()
+    cleaned_output = subset[["national_id", "first_name", "last_name", "gender", "mobile", "visit_date", "visit_date_ui", "visit_datetime_ui", "visit_date_db", "tags"]].copy()
 
+    # Process excluded records
     if not excluded.empty:
         excluded["visit_date_parsed"] = excluded["visit_date_raw"].apply(parse_visit_date)
         excluded["visit_date"] = excluded["visit_date_parsed"].apply(format_visit_date)
+        excluded["visit_date_ui"] = excluded["visit_date_parsed"].apply(format_visit_date_for_ui)
+        excluded["visit_datetime_ui"] = excluded["visit_date_parsed"].apply(format_visit_datetime_for_ui)
+        excluded["visit_date_db"] = excluded["visit_date_parsed"].apply(format_visit_date_for_database)
         excluded["tags"] = excluded.apply(build_tags, axis=1)
     else:
         excluded["visit_date"] = pd.NA
+        excluded["visit_date_ui"] = pd.NA
+        excluded["visit_datetime_ui"] = pd.NA
+        excluded["visit_date_db"] = pd.NA
         excluded["tags"] = ""
 
     excluded_output = excluded[
-        ["full_name", "national_id", "first_name", "last_name", "mobile", "visit_date", "tags"]
+        ["full_name", "national_id", "first_name", "last_name", "gender", "mobile", "visit_date", "visit_date_ui", "visit_datetime_ui", "visit_date_db", "tags"]
     ].copy()
 
-    return cleaned_output, excluded_output
+    # Process duplicate phone records
+    if not phone_duplicates.empty:
+        phone_duplicates["visit_date"] = phone_duplicates["visit_date_parsed"].apply(format_visit_date)
+        phone_duplicates["visit_date_ui"] = phone_duplicates["visit_date_parsed"].apply(format_visit_date_for_ui)
+        phone_duplicates["visit_datetime_ui"] = phone_duplicates["visit_date_parsed"].apply(format_visit_datetime_for_ui)
+        phone_duplicates["visit_date_db"] = phone_duplicates["visit_date_parsed"].apply(format_visit_date_for_database)
+        phone_duplicates["tags"] = phone_duplicates.apply(build_tags, axis=1)
+    else:
+        phone_duplicates = pd.DataFrame(columns=["national_id", "first_name", "last_name", "gender", "mobile", "visit_date", "visit_date_ui", "visit_datetime_ui", "visit_date_db", "tags"])
+
+    duplicate_phone_output = phone_duplicates[
+        ["national_id", "first_name", "last_name", "gender", "mobile", "visit_date", "visit_date_ui", "visit_datetime_ui", "visit_date_db", "tags"]
+    ].copy()
+
+    # Process incomplete name records from enhanced deduplication
+    if hasattr(_enhanced_deduplication, 'incomplete_records') and not _enhanced_deduplication.incomplete_records.empty:
+        incomplete_records = _enhanced_deduplication.incomplete_records.copy()
+        incomplete_records["visit_date"] = incomplete_records["visit_date_parsed"].apply(format_visit_date)
+        incomplete_records["visit_date_ui"] = incomplete_records["visit_date_parsed"].apply(format_visit_date_for_ui)
+        incomplete_records["visit_datetime_ui"] = incomplete_records["visit_date_parsed"].apply(format_visit_datetime_for_ui)
+        incomplete_records["visit_date_db"] = incomplete_records["visit_date_parsed"].apply(format_visit_date_for_database)
+        incomplete_records["tags"] = incomplete_records.apply(build_tags, axis=1)
+        incomplete_name_output = incomplete_records[
+            ["national_id", "first_name", "last_name", "gender", "mobile", "visit_date", "visit_date_ui", "visit_datetime_ui", "visit_date_db", "tags"]
+        ].copy()
+        LOGGER.info("Found %d records with incomplete names that couldn't be completed", len(incomplete_name_output))
+    else:
+        incomplete_name_output = pd.DataFrame(columns=["national_id", "first_name", "last_name", "gender", "mobile", "visit_date", "visit_date_ui", "visit_datetime_ui", "visit_date_db", "tags"])
+
+    return cleaned_output, excluded_output, duplicate_phone_output, incomplete_name_output
 
 
 def merge_dataframes(input_files: list[Path]) -> pd.DataFrame:
@@ -535,7 +873,7 @@ def main() -> None:
         raise FileExistsError(f"Output file already exists: {output}. Use --overwrite to replace it.")
 
     LOGGER.info("Cleaning data")
-    cleaned, excluded = clean_dataframe(df)
+    cleaned, excluded, duplicate_phone, incomplete_name = clean_dataframe(df)
 
     LOGGER.info("Writing %d rows to %s", len(cleaned), output)
     export_dataframe(cleaned, output)
@@ -544,6 +882,16 @@ def main() -> None:
         excluded_output = output.with_name(f"{output.stem}_excluded{output.suffix}")
         LOGGER.info("Writing %d excluded rows to %s", len(excluded), excluded_output)
         export_dataframe(excluded, excluded_output)
+
+    if not duplicate_phone.empty:
+        duplicate_phone_output = output.with_name(f"{output.stem}_duplicate_phone{output.suffix}")
+        LOGGER.info("Writing %d duplicate phone records to %s", len(duplicate_phone), duplicate_phone_output)
+        export_dataframe(duplicate_phone, duplicate_phone_output)
+
+    if not incomplete_name.empty:
+        incomplete_name_output = output.with_name(f"{output.stem}_incomplete_name{output.suffix}")
+        LOGGER.info("Writing %d incomplete name records to %s", len(incomplete_name), incomplete_name_output)
+        export_dataframe(incomplete_name, incomplete_name_output)
 
 
 if __name__ == "__main__":
